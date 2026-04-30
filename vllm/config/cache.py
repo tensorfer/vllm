@@ -69,7 +69,7 @@ def _get_prefix_cache_retention_interval() -> int | None:
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
-KVOffloadingBackend = Literal["native", "lmcache"]
+KVOffloadingBackend = Literal["native", "explicit", "lmcache"]
 
 
 @config
