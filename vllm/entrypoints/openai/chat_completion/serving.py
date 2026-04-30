@@ -717,6 +717,7 @@ class OpenAIServingChat(GenerateBaseServing):
                         id=request_id,
                         object=chunk_object_type,
                         created=created_time,
+                        kv_transfer_params=res.kv_transfer_params,
                         choices=[choice_data],
                         model=model_name,
                     )
