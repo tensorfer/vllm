@@ -48,3 +48,9 @@ ExOffloadingStorageFactory.register_storage(
     "vllm.distributed.kv_transfer.kv_connector.v1.explicit_offloading.storage.gd2fs",
     "GD2FSStorage",
 )
+
+ExOffloadingStorageFactory.register_storage(
+    "nfs",
+    "vllm.distributed.kv_transfer.kv_connector.v1.explicit_offloading.storage.nfs",
+    "NFSStorage",
+)
