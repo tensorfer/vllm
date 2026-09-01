@@ -216,6 +216,10 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        # Requests rejected by the KV connector's match guard (stored KV
+        # covers more than the re-tokenized prompt). They are finished with an
+        # error so the caller retries fresh; the engine stays up.
+        self._connector_rejected_req_ids: set[str] = set()
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -853,11 +857,29 @@ class Scheduler(SchedulerInterface):
                         block_aligned_local = (
                             num_new_local_computed_tokens - partial_tail
                         )
-                        ext_tokens, load_kv_async = (
-                            self.connector.get_num_new_matched_tokens(
-                                request, block_aligned_local
+                        try:
+                            ext_tokens, load_kv_async = (
+                                self.connector.get_num_new_matched_tokens(
+                                    request, block_aligned_local
+                                )
                             )
-                        )
+                        except ValueError as e:
+                            # The connector refused to match (stored KV covers
+                            # more than the re-tokenized prompt). Fail this one
+                            # request with an error instead of raising into the
+                            # engine: the caller sees the error and retries with
+                            # a fresh turn (recompute), the engine stays up.
+                            logger.error(
+                                "Request %s rejected by KV connector: %s",
+                                request_id,
+                                e,
+                            )
+                            request_queue.pop_request()
+                            self.finish_requests(
+                                (request_id,), RequestStatus.FINISHED_ERROR
+                            )
+                            self._connector_rejected_req_ids.add(request_id)
+                            continue
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -2142,6 +2164,26 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                     )
                 )
+
+        # Requests rejected by the KV connector's match guard: surface the
+        # error to the client (finish_reason=ERROR -> 500), engine stays up.
+        if self._connector_rejected_req_ids:
+            requests = [
+                self.requests[req_id]
+                for req_id in self._connector_rejected_req_ids
+                if req_id in self.requests
+            ]
+            for request in requests:
+                outputs[request.client_index].append(
+                    EngineCoreOutput(
+                        request_id=request.request_id,
+                        new_token_ids=[],
+                        finish_reason=request.get_finished_reason(),
+                        events=request.take_events(),
+                        trace_headers=request.trace_headers,
+                    )
+                )
+            self._connector_rejected_req_ids.clear()
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:

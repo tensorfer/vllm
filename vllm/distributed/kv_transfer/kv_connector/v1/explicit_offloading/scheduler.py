@@ -77,14 +77,16 @@ class ExOffloadingConnectorScheduler:
         )
 
         if stored_exkvcache.token_length > request.num_tokens:
-            logger.warning(
-                "Request %s has invalid stored_kvcache.token_length(=%d) "
-                "which is greater than request.num_tokens(=%d)",
-                request.request_id,
-                stored_exkvcache.token_length,
-                request.num_tokens,
+            # The stored prefix covers more tokens than the re-tokenized
+            # prompt. Matching it would silently drop KV-covered text and
+            # desync stored KV from the reconstructed text, so fail the
+            # request instead: the caller retries with a fresh turn.
+            raise ValueError(
+                f"Request {request.request_id} has stored_kvcache.token_length "
+                f"(={stored_exkvcache.token_length}) greater than "
+                f"request.num_tokens(={request.num_tokens}); refusing to drop "
+                f"KV-covered text"
             )
-            return 0, False
 
         matched = stored_exkvcache.token_length - num_computed_tokens
         if matched <= params.load_threshold:
