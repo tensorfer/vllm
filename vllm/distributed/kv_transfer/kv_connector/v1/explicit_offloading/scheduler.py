@@ -29,6 +29,11 @@ class ExOffloadingParams:
     stored_kvcache: list[dict[str, Any]] = field(default_factory=list)
     fresh_kvcache: list[dict[str, Any]] = field(default_factory=list)
     load_threshold: int = 0
+    flags: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def prefill_only(self) -> bool:
+        return bool(self.flags.get("prefill-only"))
 
 
 def extract_kvcache_params(
@@ -40,7 +45,11 @@ def extract_kvcache_params(
     params = None
     for k, v in kv_transfer_params.items():
         if k == "kvcache_params":
-            params = ExOffloadingParams(**v)
+            try:
+                params = ExOffloadingParams(**v)
+            except TypeError:
+                # Unknown/legacy fields must not crash the engine.
+                logger.warning("malformed kvcache_params, ignoring: %s", v)
 
     return params
 
@@ -178,8 +187,17 @@ class ExOffloadingConnectorScheduler:
             params.fresh_kvcache, block_size=self._block_size
         )
 
-        num_tokens_aligned = round_down(request.num_tokens, self._block_size)
-        fresh_exkvcache.truncate_suffix(num_tokens_aligned)
+        # Round down to the block boundary: a trailing partial block is not
+        # saved; the next request recomputes those tokens. A prefill-only
+        # request saves the prompt range, keeping the forced decode token
+        # (max_tokens=1) out of the saved KV.
+        save_tokens = (
+            request.num_prompt_tokens
+            if params.prefill_only else request.num_tokens
+        )
+        fresh_exkvcache.truncate_suffix(
+            round_down(save_tokens, self._block_size)
+        )
         fresh_exkvcache.bind_block_ids(block_ids)
         fresh_exkvcache.update_kv_layout(kv_length_per_token=self._kv_bytes_per_token)
 
