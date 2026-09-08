@@ -4,10 +4,12 @@ import asyncio
 import bisect
 import os
 import urllib.parse
+from collections.abc import Awaitable, Callable
 from enum import Enum
 from typing import Any
 
 import pygd2fs
+import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.explicit_offloading.net_device import (  # noqa: E501
     DeviceInfo,
@@ -20,12 +22,24 @@ from vllm.distributed.kv_transfer.kv_connector.v1.explicit_offloading.storage.ab
     ExOffloadingStorage,
     ExOffloadingStorageKVCacheConfig,
     RegionDesc,
+    RegionTensor,
     build_mem_zones,
+    copy_data_d2h,
+    copy_data_h2d,
+    copy_data_split_chunks,
     get_mem_regions,
+    get_mem_tensors,
+    tensors_total_numel,
 )
 from vllm.logger import init_logger
+from vllm.utils.argparse_utils import human_readable_int
+from vllm.utils.math_utils import round_up
 
 logger = init_logger(__name__)
+
+GD2FS_FILE_ALIGN = 2 * 1024 * 1024
+GD2FS_BOUNCE_CHUNK_SIZE = 4 * 1024 * 1024
+GD2FS_BOUNCE_MAX_SIZE = 4 * 1024 * 1024 * 1024
 
 
 class GD2FSIOPolicy(Enum):
@@ -189,6 +203,13 @@ class GD2FSStorage(ExOffloadingStorage):
         self.load_policy = self.get_io_policy("GD2FS_LOAD_POLICY")
         self.save_policy = self.get_io_policy("GD2FS_SAVE_POLICY")
         self.check_io_policy()
+        self.bounce_size = round_up(
+            human_readable_int(os.getenv("GD2FS_BOUNCE_SIZE", "128M")),
+            GD2FS_BOUNCE_CHUNK_SIZE,
+        )
+        if self.bounce_size > GD2FS_BOUNCE_MAX_SIZE:
+            logger.info("GD2FS_BOUNCE_SIZE uses 4G")
+            self.bounce_size = GD2FS_BOUNCE_MAX_SIZE
 
         self._load_fn = (
             self._load_direct
@@ -312,6 +333,9 @@ class GD2FSStorage(ExOffloadingStorage):
             self.mem_region_addrs, self.mem_region_block_bytes, block_ids
         )
 
+    def _get_mem_tensors(self, block_ids: list[list[int]]) -> list[RegionTensor]:
+        return get_mem_tensors(self.kvcache_config.kv_caches, block_ids)
+
     def _create_sge_direct(self, mems: list[tuple[int, int]]) -> list[pygd2fs.SGE]:
         sgs = []
         for addr, size in mems:
@@ -363,15 +387,145 @@ class GD2FSStorage(ExOffloadingStorage):
             *[__save_region(region) for region in self._get_mem_regions(block_ids)]
         )
 
+    def _alloc_bounce(self, bytes: int) -> tuple[torch.Tensor, pygd2fs.IOMEM]:
+        bounce_bytes = max(
+            GD2FS_BOUNCE_CHUNK_SIZE,
+            min(self.bounce_size, round_up(bytes, GD2FS_BOUNCE_CHUNK_SIZE)),
+        )
+        bounce_data = torch.empty(
+            (bounce_bytes // GD2FS_BOUNCE_CHUNK_SIZE, GD2FS_BOUNCE_CHUNK_SIZE),
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=True,
+        )
+        iomem = self.client.RegIOMEM(bounce_data.data_ptr(), bounce_bytes)
+        if iomem is None:
+            raise RuntimeError("cannot register bounce iomem")
+        return bounce_data, iomem
+
+    async def _process_bounce_chunks(
+        self,
+        op: str,
+        filepath: str,
+        total_bytes: int,
+        chunks: list[tuple[int, int, int, int]],
+        num_slots: int,
+        io_chunk: Callable[[int, int], Awaitable[int]],
+    ) -> None:
+        pending: set[asyncio.Task] = set()
+        next_chunk = 0
+        for slot in range(min(num_slots, len(chunks))):
+            pending.add(asyncio.ensure_future(io_chunk(next_chunk, slot)))
+            next_chunk += 1
+
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    slot = task.result()
+                    if next_chunk < len(chunks):
+                        pending.add(asyncio.ensure_future(io_chunk(next_chunk, slot)))
+                        next_chunk += 1
+        finally:
+            for task in pending:
+                task.cancel()
+
     async def _load_bounce(
         self, filepath: str, offset: int, block_ids: list[list[int]]
     ) -> None:
-        raise NotImplementedError
+        async def __load_region(region: RegionTensor):
+            file_offset = region.offset + offset
+            mem_tensors = region.tensors
+            dtype = mem_tensors[0].dtype
+            total_bytes = dtype.itemsize * tensors_total_numel(mem_tensors)
+
+            bounce_data, bounce_iomem = self._alloc_bounce(total_bytes)
+            try:
+                chunks = copy_data_split_chunks(
+                    bounce_data[0].view(dtype),
+                    mem_tensors,
+                    file_offset,
+                    GD2FS_FILE_ALIGN,
+                    copy_data_h2d,
+                )
+
+                async def load_chunk(chunk_idx: int, chunk: int) -> int:
+                    chunk_off, chunk_len, dev_index, dev_off = chunks[chunk_idx]
+                    sge = pygd2fs.SGE(
+                        bounce_data[chunk].data_ptr(), chunk_len, bounce_iomem
+                    )
+                    req = await self.client.ReadAsync(filepath, chunk_off, [sge], 0)
+                    self._check_req_result(req, chunk_len)
+                    host = bounce_data[chunk][:chunk_len].view(dtype)
+                    copy_data_h2d(
+                        host, mem_tensors, dev_index, dev_off, host_bytes=chunk_len
+                    )
+                    return chunk
+
+                await self._process_bounce_chunks(
+                    "LOAD",
+                    filepath,
+                    total_bytes,
+                    chunks,
+                    bounce_data.shape[0],
+                    load_chunk,
+                )
+            finally:
+                self.client.DeregIOMEM(bounce_iomem)
+
+        await asyncio.gather(
+            *[__load_region(region) for region in self._get_mem_tensors(block_ids)]
+        )
 
     async def _save_bounce(
         self, filepath: str, offset: int, block_ids: list[list[int]]
     ) -> None:
-        raise NotImplementedError
+        async def __save_region(region: RegionTensor):
+            file_offset = region.offset + offset
+            mem_tensors = region.tensors
+
+            dtype = mem_tensors[0].dtype
+            total_bytes = dtype.itemsize * tensors_total_numel(mem_tensors)
+
+            bounce_data, bounce_iomem = self._alloc_bounce(total_bytes)
+            try:
+                chunks = copy_data_split_chunks(
+                    bounce_data[0].view(dtype),
+                    mem_tensors,
+                    file_offset,
+                    GD2FS_FILE_ALIGN,
+                    copy_data_d2h,
+                )
+
+                async def save_chunk(chunk_idx: int, slot: int) -> int:
+                    chunk_off, chunk_len, dev_index, dev_off = chunks[chunk_idx]
+                    host = bounce_data[slot][:chunk_len].view(dtype)
+                    copy_data_d2h(
+                        host, mem_tensors, dev_index, dev_off, host_bytes=chunk_len
+                    )
+                    sge = pygd2fs.SGE(
+                        bounce_data[slot].data_ptr(), chunk_len, bounce_iomem
+                    )
+                    req = await self.client.WriteAsync(filepath, chunk_off, [sge], 0)
+                    self._check_req_result(req, chunk_len)
+                    return slot
+
+                await self._process_bounce_chunks(
+                    "SAVE",
+                    filepath,
+                    total_bytes,
+                    chunks,
+                    bounce_data.shape[0],
+                    save_chunk,
+                )
+            finally:
+                self.client.DeregIOMEM(bounce_iomem)
+
+        await asyncio.gather(
+            *[__save_region(region) for region in self._get_mem_tensors(block_ids)]
+        )
 
     async def load(
         self, filepath: str, offset: int, block_ids: list[list[int]]
