@@ -13,10 +13,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.explicit_offloading.common imp
     ExOffloadingRequestContext,
 )
 from vllm.logger import init_logger
-from vllm.utils.math_utils import round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+)
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
@@ -70,6 +72,17 @@ class ExOffloadingConnectorScheduler:
             )
 
         self._kv_bytes_per_token = sum(self._block_bytes_per_layer) // self._block_size
+
+        self._kv_cache_groups = kv_cache_config.kv_cache_groups
+
+        self._is_hma_required = (
+            not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+            # Also handle unlikely SW-only model case instead of checking num_groups>1.
+            and any(
+                not isinstance(g.kv_cache_spec, FullAttentionSpec)
+                for g in kv_cache_config.kv_cache_groups
+            )
+        )
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -129,12 +142,12 @@ class ExOffloadingConnectorScheduler:
 
         assert stored_exkvcache.token_end == fresh_exkvcache.token_start
 
+        block_ids = blocks.get_block_ids()
         num_computed_tokens = stored_exkvcache.token_length - num_external_tokens
-        stored_exkvcache.truncate_prefix(num_computed_tokens)
+        num_computed_blocks = num_computed_tokens // self._block_size
 
-        group_block_ids = blocks.get_block_ids()
-        assert len(group_block_ids) == 1, "Not support HMA"
-        stored_exkvcache.bind_block_ids(group_block_ids[0])
+        stored_exkvcache.truncate_prefix(num_computed_blocks)
+        stored_exkvcache.bind_block_ids(block_ids, self._kv_cache_groups)
         stored_exkvcache.update_kv_layout(kv_length_per_token=self._kv_bytes_per_token)
 
         self._loading_requests[request.request_id] = ExOffloadingRequestContext(
@@ -167,7 +180,7 @@ class ExOffloadingConnectorScheduler:
     def request_finished(
         self,
         request: Request,
-        block_ids: list[int],
+        block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         if len(block_ids) == 0:
             return False, None
@@ -187,18 +200,23 @@ class ExOffloadingConnectorScheduler:
             params.fresh_kvcache, block_size=self._block_size
         )
 
+        if self._is_hma_required:
+            assert len(fresh_exkvcache) == 1, (
+                f"Request {request.request_id} has invalid fresh_kvcache with "
+                f"{len(fresh_exkvcache)} segments, expected 1 segment for HMA"
+            )
+
         # Round down to the block boundary: a trailing partial block is not
         # saved; the next request recomputes those tokens. A prefill-only
         # request saves the prompt range, keeping the forced decode token
         # (max_tokens=1) out of the saved KV.
         save_tokens = (
-            request.num_prompt_tokens
-            if params.prefill_only else request.num_tokens
+            request.num_prompt_tokens if params.prefill_only else request.num_tokens
         )
-        fresh_exkvcache.truncate_suffix(
-            round_down(save_tokens, self._block_size)
-        )
-        fresh_exkvcache.bind_block_ids(block_ids)
+        block_count = save_tokens // self._block_size
+
+        fresh_exkvcache.truncate_suffix(block_count)
+        fresh_exkvcache.bind_block_ids(block_ids, self._kv_cache_groups)
         fresh_exkvcache.update_kv_layout(kv_length_per_token=self._kv_bytes_per_token)
 
         kv_xfer_params = dict(

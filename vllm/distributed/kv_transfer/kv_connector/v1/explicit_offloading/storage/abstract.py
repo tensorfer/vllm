@@ -3,15 +3,15 @@
 from abc import abstractmethod
 from dataclasses import dataclass
 
-import numpy as np
 import torch
+
+from vllm.utils.torch_utils import is_non_overlapping_and_dense
 
 
 @dataclass
 class ExOffloadingStorageKVCacheConfig:
     kv_caches: dict[str, torch.Tensor]
-    split_k_and_v: bool
-    is_block_first: bool
+    num_blocks: int
 
 
 class ExOffloadingStorage:
@@ -26,140 +26,152 @@ class ExOffloadingStorage:
     def register_kvcache(self, config: ExOffloadingStorageKVCacheConfig) -> None: ...
 
     @abstractmethod
-    async def load(self, filepath: str, offset: int, block_ids: list[int]) -> None: ...
+    async def load(
+        self, filepath: str, offset: int, block_ids: list[list[int]]
+    ) -> None: ...
 
     @abstractmethod
-    async def save(self, filepath: str, offset: int, block_ids: list[int]) -> None: ...
+    async def save(
+        self, filepath: str, offset: int, block_ids: list[list[int]]
+    ) -> None: ...
 
 
-def build_mem_regions(
+def build_mem_zones(
     kvcache_config: ExOffloadingStorageKVCacheConfig,
-) -> tuple[list[tuple[int, int]], list[int]]:
-    assert not kvcache_config.is_block_first, (
-        "Explicit offloading does not support block first layout"
-    )
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[int]]:
+    mem_zones: list[tuple[int, int]] = []
+    mem_region_addrs: list[tuple[int, int]] = []
+    mem_region_block_bytes: list[int] = []
 
-    split_k_and_v = kvcache_config.split_k_and_v
+    seen_zones_ptrs: set[int] = set()
+    seen_region_ptrs: dict[int, tuple[int, int]] = {}
 
-    seen_base_addrs = []
-    mem_regions_per_layer = []
-    block_bytes_per_layer = []
-    num_blocks = 0
+    num_blocks = kvcache_config.num_blocks
 
-    tensor_size_bytes = None
-    for _, cache_or_caches in kvcache_config.kv_caches.items():
-        cache_list = cache_or_caches if split_k_and_v else [cache_or_caches]
-        for cache in cache_list:
-            cache_addr = cache.data_ptr()
-            if cache_addr in seen_base_addrs:
-                continue
+    for cache in kvcache_config.kv_caches.values():
+        zone = cache.untyped_storage()
+        zone_addr = zone.data_ptr()
+        zone_bytes = zone.nbytes()
 
-            seen_base_addrs.append(cache_addr)
+        if zone_addr not in seen_zones_ptrs:
+            seen_zones_ptrs.add(zone_addr)
+            mem_zones.append((zone_addr, zone_bytes))
 
-            cache_bytes = cache.nbytes
-            if tensor_size_bytes is None:
-                tensor_size_bytes = cache_bytes
-                num_blocks = cache.shape[0]
-            assert cache.shape[0] == num_blocks, (
-                "All kv cache tensors must have the same number of blocks"
-            )
-            assert cache_bytes % num_blocks == 0, (
-                "Explicit offloading expects each kv cache tensor size to be "
-                "divisible by the number of blocks."
-            )
+        if not is_non_overlapping_and_dense(cache[0]):
+            raise ValueError("Not support `*H*B*` layout for KV cache")
 
-            block_bytes_per_layer.append(cache_bytes // num_blocks)
-            mem_regions_per_layer.append((cache_addr, cache_bytes))
+        block_bytes = cache.stride(0) * cache.element_size()
 
-    if split_k_and_v:
-        mem_regions_per_layer = mem_regions_per_layer[::2] + mem_regions_per_layer[1::2]
-        block_bytes_per_layer = block_bytes_per_layer[::2] + block_bytes_per_layer[1::2]
+        if block_bytes * num_blocks == zone_bytes:
+            addr = zone_addr
+            nbytes = zone_bytes
+        else:
+            addr = cache.data_ptr()
+            nbytes = cache.nbytes
 
-    return mem_regions_per_layer, block_bytes_per_layer
+        if addr not in seen_region_ptrs or addr > seen_region_ptrs[addr][0]:
+            seen_region_ptrs[addr] = (nbytes, block_bytes)
+
+    for addr, (nbytes, block_bytes) in seen_region_ptrs.items():
+        mem_region_addrs.append((addr, nbytes))
+        mem_region_block_bytes.append(block_bytes)
+
+    return mem_zones, mem_region_addrs, mem_region_block_bytes
 
 
 def group_block_contiguous(block_ids: list[int]) -> list[list[int]]:
-    if len(block_ids) == 0:
+    if not block_ids:
         return []
 
-    brk = np.where(np.diff(block_ids) != 1)[0] + 1
-    groups = np.split(block_ids, brk)
-    return [g.tolist() for g in groups]
+    groups: list[list[int]] = []
+    group_start = 0
+    for index in range(1, len(block_ids)):
+        previous_id = block_ids[index - 1]
+        current_id = block_ids[index]
+        is_contiguous = current_id in (previous_id, previous_id + 1)
+        is_placeholder_transition = previous_id == 0 and current_id != 0
+        if not is_contiguous or is_placeholder_transition:
+            groups.append(block_ids[group_start:index])
+            group_start = index
+
+    groups.append(block_ids[group_start:])
+    return groups
+
+
+@dataclass
+class RegionDesc:
+    offset: int
+    address: list[tuple[int, int]]
+
+
+def _build_mem_regions_for_zone(
+    region_addr: int,
+    region_size: int,
+    block_bytes: int,
+    grouped_block_ids: list[list[int]],
+    file_offset: int,
+) -> tuple[list[RegionDesc], int]:
+    """Build file-to-memory mappings for one memory zone."""
+    regions: list[RegionDesc] = []
+    current_region: RegionDesc | None = None
+
+    for group in grouped_block_ids:
+        group_size = len(group) * block_bytes
+
+        if group[0] == 0:
+            if current_region is not None:
+                regions.append(current_region)
+                current_region = None
+            file_offset += group_size
+            continue
+
+        group_addr = region_addr + group[0] * block_bytes
+        group_end = group_addr + group_size
+        region_end = region_addr + region_size
+        if group_end > region_end:
+            raise ValueError(
+                f"memory region [{group_addr}, {group_end}] is out of bound"
+            )
+
+        if current_region is None:
+            current_region = RegionDesc(offset=file_offset, address=[])
+
+        current_region.address.append((group_addr, group_size))
+        file_offset += group_size
+
+    if current_region is not None:
+        regions.append(current_region)
+
+    return regions, file_offset
 
 
 def get_mem_regions(
-    mem_regions_per_layer: list[tuple[int, int]],
-    block_bytes_per_layer: list[int],
-    block_ids: list[int],
-) -> list[tuple[int, int]]:
-    group_block_ids = group_block_contiguous(block_ids)
-    mem_regions = []
+    mem_region_addrs: list[tuple[int, int]],
+    mem_region_block_bytes: list[int],
+    block_ids: list[list[int]],
+) -> list[RegionDesc]:
+    """Map logical block IDs to file offsets and GPU memory addresses."""
+    if len(mem_region_addrs) != len(mem_region_block_bytes):
+        raise ValueError(
+            "mem_region_addrs and mem_region_block_bytes must have the same length"
+        )
 
-    for layer_idx, (addr, bytes) in enumerate(mem_regions_per_layer):
-        block_bytes = block_bytes_per_layer[layer_idx]
+    flattened_block_ids = [block_id for group in block_ids for block_id in group]
+    grouped_block_ids = group_block_contiguous(flattened_block_ids)
 
-        for group in group_block_ids:
-            group_addr = addr + group[0] * block_bytes
-            group_size = len(group) * block_bytes
+    mem_regions: list[RegionDesc] = []
+    file_offset = 0
 
-            if group_addr + group_size > addr + bytes:
-                raise ValueError(
-                    f"memory region [{group_addr}, {group_addr + group_size}] "
-                    "is out of bound"
-                )
-
-            mem_regions.append((group_addr, group_size))
+    for (region_addr, region_size), block_bytes in zip(
+        mem_region_addrs, mem_region_block_bytes
+    ):
+        zone_regions, file_offset = _build_mem_regions_for_zone(
+            region_addr,
+            region_size,
+            block_bytes,
+            grouped_block_ids,
+            file_offset,
+        )
+        mem_regions.extend(zone_regions)
 
     return mem_regions
-
-
-def get_mem_tensors(
-    kv_caches: dict[str, torch.Tensor],
-    block_ids: list[int],
-    split_k_and_v: bool,
-) -> list[torch.Tensor]:
-    group_block_ids = group_block_contiguous(block_ids)
-    k_mem_tensors: list[torch.Tensor] = []
-    v_mem_tensors: list[torch.Tensor] = []
-
-    for kv_cache in kv_caches.values():
-        for group in group_block_ids:
-            if split_k_and_v:
-                k_mem_tensors.append(
-                    kv_cache[0, group[0] : (group[0] + len(group)), :, :, :]
-                )
-                v_mem_tensors.append(
-                    kv_cache[1, group[0] : (group[0] + len(group)), :, :, :]
-                )
-            else:
-                k_mem_tensors.append(kv_cache[group[0] : (group[0] + len(group)), :, :])
-
-    return k_mem_tensors + v_mem_tensors
-
-
-def copy_data_h2d(host_data: torch.Tensor, data: list[torch.Tensor]):
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        off = 0
-        for d in data:
-            df = d.flatten()
-            len = df.numel()
-            df.copy_(host_data[off : off + len], non_blocking=True)
-            off += len
-    stream.synchronize()
-
-
-def copy_data_d2h(data: list[torch.Tensor], host_data: torch.Tensor):
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        off = 0
-        for d in data:
-            df = d.flatten()
-            len = df.numel()
-            host_data[off : off + len].copy_(df, non_blocking=True)
-            off += len
-    stream.synchronize()
-
-
-def tensors_total_numel(tensors: list[torch.Tensor]) -> int:
-    return sum(tensor.numel() for tensor in tensors)

@@ -6,10 +6,6 @@ import threading
 import torch
 
 from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.utils import (
-    TransferTopology,
-    get_current_attn_backend,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.explicit_offloading.common import (
     ExOffloadingConnectorMetadata,
     ExOffloadingRequestContext,
@@ -37,24 +33,11 @@ class ExOffloadingConnectorWorker:
     def __init__(self, vllm_config: VllmConfig):
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
+        assert vllm_config.cache_config.num_gpu_blocks is not None
 
+        self._num_blocks = vllm_config.cache_config.num_gpu_blocks
         self._tp_rank = get_tensor_model_parallel_rank()
         self._tp_size = get_tensor_model_parallel_world_size()
-        self._block_size = vllm_config.cache_config.block_size
-        self._engine_id = vllm_config.kv_transfer_config.engine_id
-        self._use_mla = vllm_config.model_config.use_mla
-        self._total_num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
-
-        self._transfer_topo = TransferTopology(
-            tp_rank=self._tp_rank,
-            tp_size=self._tp_size,
-            block_size=self._block_size,
-            engine_id=self._engine_id,
-            is_mla=self._use_mla,
-            is_mamba=False,
-            total_num_kv_heads=self._total_num_kv_heads,
-            attn_backends=[get_current_attn_backend(vllm_config)],
-        )
 
         self._io_loop = asyncio.new_event_loop()
         self._io_thread = threading.Thread(
@@ -69,9 +52,7 @@ class ExOffloadingConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self._kvcache_config = ExOffloadingStorageKVCacheConfig(
-            kv_caches=kv_caches,
-            split_k_and_v=self._transfer_topo.split_k_and_v,
-            is_block_first=self._transfer_topo.is_kv_layout_blocks_first,
+            kv_caches=kv_caches, num_blocks=self._num_blocks
         )
 
     async def _start_load_task(self, ctx: ExOffloadingRequestContext):
@@ -80,7 +61,7 @@ class ExOffloadingConnectorWorker:
         try:
             ctx.exkvcache.update_kv_layout(
                 tp_rank=self._tp_rank,
-                replicates_kv_cache=self._transfer_topo.local_replicates_kv_cache,
+                replicates_kv_cache=False,  # TODO(zhangrui): support MLA
             )
             await ctx.exkvcache.prefetch(self._kvcache_config)
         except Exception as e:
@@ -88,7 +69,12 @@ class ExOffloadingConnectorWorker:
                 "(%s:%s) Failed loading kv cache: %s", ctx.id, ctx.request_id, e
             )
             assert ctx.exkvcache.block_ids is not None
-            self._invalid_block_ids.update(ctx.exkvcache.block_ids)
+            block_ids_set = {
+                block_id
+                for group_block_ids in ctx.exkvcache.block_ids
+                for block_id in group_block_ids
+            }
+            self._invalid_block_ids.update(block_ids_set)
 
         self._finished_load_req_ids.add(ctx.request_id)
 
@@ -100,11 +86,13 @@ class ExOffloadingConnectorWorker:
     async def _start_save_task(self, ctx: ExOffloadingRequestContext):
         assert ctx.request_id not in self._finished_save_req_ids
 
-        if self._transfer_topo.local_replicates_kv_cache and self._tp_rank == 0:
+        is_mla = False  # TODO(zhangrui): support MLA
+
+        if (is_mla and self._tp_rank == 0) or not is_mla:
             try:
                 ctx.exkvcache.update_kv_layout(
                     tp_rank=self._tp_rank,
-                    replicates_kv_cache=self._transfer_topo.local_replicates_kv_cache,
+                    replicates_kv_cache=is_mla,
                 )
                 await ctx.exkvcache.backup(self._kvcache_config)
             except Exception as e:

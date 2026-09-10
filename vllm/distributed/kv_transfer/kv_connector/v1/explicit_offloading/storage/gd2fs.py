@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import asyncio
 import bisect
 import os
 import urllib.parse
@@ -7,7 +8,6 @@ from enum import Enum
 from typing import Any
 
 import pygd2fs
-import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.explicit_offloading.net_device import (  # noqa: E501
     DeviceInfo,
@@ -19,12 +19,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.explicit_offloading.net_device
 from vllm.distributed.kv_transfer.kv_connector.v1.explicit_offloading.storage.abstract import (  # noqa: E501
     ExOffloadingStorage,
     ExOffloadingStorageKVCacheConfig,
-    build_mem_regions,
-    copy_data_d2h,
-    copy_data_h2d,
+    RegionDesc,
+    build_mem_zones,
     get_mem_regions,
-    get_mem_tensors,
-    tensors_total_numel,
 )
 from vllm.logger import init_logger
 
@@ -124,6 +121,11 @@ def select_dpaddrs(dpaddrs: str, n: int = 0) -> list[DPAddrInfo]:
         dpaddr.update(nic_name, distance_level, distance)
         result.append(dpaddr)
 
+    # none address is selected, typicall device has -1 NUMA, use all
+    if len(result) == 0:
+        for dpaddr in dpaddr_info_dict.values():
+            result.append(dpaddr)
+
     logger.info("%s selected dpaddrs: %s", device_info.name, result)
 
     return result
@@ -133,6 +135,9 @@ def get_protocol(dpaddr_info_list: list[DPAddrInfo]) -> str:
     protocols: set[str] = set()
     for dpaddr_info in dpaddr_info_list:
         protocols.add(dpaddr_info.protocol)
+
+    if not protocols:
+        raise ValueError("DPADDR list is empty")
 
     if len(protocols) > 1:
         raise ValueError(
@@ -176,8 +181,10 @@ class GD2FSStorage(ExOffloadingStorage):
         if self.client is None:
             raise RuntimeError("cannot connect to GD2FS cluster")
 
-        self.mem_regions_per_layer: list[tuple[int, int]] = []
-        self.mem_regions_iomem: list[tuple[int, int, pygd2fs.IOMEM]] = []
+        self.mem_zones: list[tuple[int, int]] = []
+        self.mem_zones_iomem: list[tuple[int, int, pygd2fs.IOMEM]] = []
+        self.mem_region_addrs: list[tuple[int, int]] = []
+        self.mem_region_block_bytes: list[int] = []
 
         self.load_policy = self.get_io_policy("GD2FS_LOAD_POLICY")
         self.save_policy = self.get_io_policy("GD2FS_SAVE_POLICY")
@@ -260,8 +267,8 @@ class GD2FSStorage(ExOffloadingStorage):
             **query,
         }, parsed.path
 
-    def _build_mem_regions_iomem(self):
-        for addr, bytes in self.mem_regions_per_layer:
+    def _build_mem_zones_iomem(self):
+        for addr, bytes in self.mem_zones:
             if self._get_iomem_by_address(addr, bytes) is not None:
                 raise ValueError(
                     f"memory [{addr}, {addr + bytes}] is already registered"
@@ -273,34 +280,36 @@ class GD2FSStorage(ExOffloadingStorage):
                     f"cannot register memory [{addr}, {addr + bytes}] to GD2FS client"
                 )
 
-            bisect.insort(self.mem_regions_iomem, (addr, addr + bytes, iomem))
+            bisect.insort(self.mem_zones_iomem, (addr, addr + bytes, iomem))
 
     def _get_iomem_by_address(self, addr: int, length: int) -> pygd2fs.IOMEM | None:
-        idx = bisect.bisect_right(self.mem_regions_iomem, (addr, float("inf"))) - 1
+        idx = bisect.bisect_right(self.mem_zones_iomem, (addr, float("inf"))) - 1
         if idx < 0:
             return None
 
-        start_addr, end_addr, iomem = self.mem_regions_iomem[idx]
+        start_addr, end_addr, iomem = self.mem_zones_iomem[idx]
         if not (start_addr <= addr <= end_addr - length + 1):
             return None
 
         return iomem
 
     def register_kvcache(self, config: ExOffloadingStorageKVCacheConfig) -> None:
-        self.mem_regions_per_layer, self.block_bytes_per_layer = build_mem_regions(
-            config
+        self.mem_zones, self.mem_region_addrs, self.mem_region_block_bytes = (
+            build_mem_zones(config)
         )
-        self._build_mem_regions_iomem()
+        if (
+            self.load_policy == GD2FSIOPolicy.DIRECT
+            or self.save_policy == GD2FSIOPolicy.DIRECT
+        ):
+            # register KV cache for DIRECT policy only, it will fail on GB10:
+            # use RDMA in BOUNCE policy without GDR supported.
+            self._build_mem_zones_iomem()
+
         self.kvcache_config = config
 
-    def _get_mem_regions(self, block_ids: list[int]) -> list[tuple[int, int]]:
+    def _get_mem_regions(self, block_ids: list[list[int]]) -> list[RegionDesc]:
         return get_mem_regions(
-            self.mem_regions_per_layer, self.block_bytes_per_layer, block_ids
-        )
-
-    def _get_mem_tensors(self, block_ids: list[int]) -> list[torch.Tensor]:
-        return get_mem_tensors(
-            self.kvcache_config.kv_caches, block_ids, self.kvcache_config.split_k_and_v
+            self.mem_region_addrs, self.mem_region_block_bytes, block_ids
         )
 
     def _create_sge_direct(self, mems: list[tuple[int, int]]) -> list[pygd2fs.SGE]:
@@ -313,91 +322,68 @@ class GD2FSStorage(ExOffloadingStorage):
             sgs.append(pygd2fs.SGE(addr, size, iomem))
         return sgs
 
-    def _create_sge_bounce(
-        self, mems: list[torch.Tensor]
-    ) -> tuple[list[pygd2fs.SGE], torch.Tensor, Any]:
-        host_data = torch.empty(
-            tensors_total_numel(mems),
-            dtype=mems[0].dtype,
-            device="cpu",
-            pin_memory=True,
-        )
-
-        length = host_data.element_size() * host_data.numel()
-        iomem = self.client.RegIOMEM(host_data.data_ptr(), length)
-        sgs = [pygd2fs.SGE(host_data.data_ptr(), length, iomem)]
-
-        return sgs, host_data, iomem
-
     def _check_req_result(self, req: pygd2fs.Request | None, expect_length: int):
         if req is None:
             raise RuntimeError("GD2FS cannot initiate request")
-        elif req.Status() != 0:
-            raise RuntimeError(f"GD2FS request status is abnormal, {req}")
-        elif req.Value() != expect_length:
-            raise RuntimeError(
-                f"GD2FS request length is abnormal, {req}, expect {expect_length}"
-            )
+        status = req.Status()
+        if status != 0:
+            _, klass, _, code = pygd2fs.InspectStatus(status)
+            raise RuntimeError(f"GD2FS request {req} error: {klass} : {code}")
+
+        if req.Value() != expect_length:
+            raise RuntimeError(f"GD2FS unexpected length {req}, expect {expect_length}")
 
     async def _load_direct(
-        self, filepath: str, offset: int, block_ids: list[int]
+        self, filepath: str, offset: int, block_ids: list[list[int]]
     ) -> None:
-        mem_regions = self._get_mem_regions(block_ids)
-        sges = self._create_sge_direct(mem_regions)
+        async def __load_region(region: RegionDesc):
+            sges = self._create_sge_direct(region.address)
+            expect_length = sum(sge.length for sge in sges)
 
-        expect_length = sum(sge.length for sge in sges)
+            req = await self.client.ReadAsync(filepath, offset + region.offset, sges, 0)
+            self._check_req_result(req, expect_length)
 
-        req = await self.client.ReadAsync(filepath, offset, sges, 0)
-        self._check_req_result(req, expect_length)
+        await asyncio.gather(
+            *[__load_region(region) for region in self._get_mem_regions(block_ids)]
+        )
 
     async def _save_direct(
-        self, filepath: str, offset: int, block_ids: list[int]
+        self, filepath: str, offset: int, block_ids: list[list[int]]
     ) -> None:
-        mem_regions = self._get_mem_regions(block_ids)
-        sges = self._create_sge_direct(mem_regions)
+        async def __save_region(region: RegionDesc):
+            sges = self._create_sge_direct(region.address)
+            expect_length = sum(sge.length for sge in sges)
 
-        expect_length = sum(sge.length for sge in sges)
+            req = await self.client.WriteAsync(
+                filepath, offset + region.offset, sges, 0
+            )
+            self._check_req_result(req, expect_length)
 
-        req = await self.client.WriteAsync(filepath, offset, sges, 0)
-        self._check_req_result(req, expect_length)
+        await asyncio.gather(
+            *[__save_region(region) for region in self._get_mem_regions(block_ids)]
+        )
 
     async def _load_bounce(
-        self, filepath: str, offset: int, block_ids: list[int]
+        self, filepath: str, offset: int, block_ids: list[list[int]]
     ) -> None:
-        mem_tensors = self._get_mem_tensors(block_ids)
-        sges, host_tensor, iomem = self._create_sge_bounce(mem_tensors)
-
-        expect_length = sum(sge.length for sge in sges)
-
-        try:
-            req = await self.client.ReadAsync(filepath, offset, sges, 0)
-            self._check_req_result(req, expect_length)
-            copy_data_h2d(host_tensor, mem_tensors)
-        finally:
-            self.client.DeregIOMEM(iomem)
+        raise NotImplementedError
 
     async def _save_bounce(
-        self, filepath: str, offset: int, block_ids: list[int]
+        self, filepath: str, offset: int, block_ids: list[list[int]]
     ) -> None:
-        mem_tensors = self._get_mem_tensors(block_ids)
-        sges, host_tensor, iomem = self._create_sge_bounce(mem_tensors)
-        copy_data_d2h(mem_tensors, host_tensor)
+        raise NotImplementedError
 
-        expect_length = sum(sge.length for sge in sges)
-
-        try:
-            req = await self.client.WriteAsync(filepath, offset, sges, 0)
-            self._check_req_result(req, expect_length)
-        finally:
-            self.client.DeregIOMEM(iomem)
-
-    async def load(self, filepath: str, offset: int, block_ids: list[int]) -> None:
+    async def load(
+        self, filepath: str, offset: int, block_ids: list[list[int]]
+    ) -> None:
         if not block_ids:
             return
 
         await self._load_fn(filepath, offset, block_ids)
 
-    async def save(self, filepath: str, offset: int, block_ids: list[int]) -> None:
+    async def save(
+        self, filepath: str, offset: int, block_ids: list[list[int]]
+    ) -> None:
         if not block_ids:
             return
 
