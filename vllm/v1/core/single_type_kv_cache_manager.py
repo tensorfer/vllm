@@ -1533,28 +1533,29 @@ class MambaManager(SingleTypeKVCacheManager):
         num_prompt_tokens: int | None = None,
     ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        return
 
-        super().remove_skipped_blocks(
-            request_id, processed_computed_tokens, num_prompt_tokens
-        )
-        if self.mamba_cache_mode == "align":
-            # `last_state_block_idx` refers to the block index allocated two steps ago.
-            # The block allocated in the previous step is used to copy Mamba states
-            # into the block allocated in the current step; the earlier block is
-            # no longer needed and should be freed here.
-            last_state_block_idx = self.last_state_block_idx.get(request_id)
-            # Blocks allocated during prefill may be non-contiguous. Use
-            # `last_state_block_idx` to free the appropriate block and replace it
-            # with a null block.
-            if (
-                last_state_block_idx is not None
-                and last_state_block_idx
-                < cdiv(processed_computed_tokens, self.block_size) - 1
-            ):
-                blocks = self.req_to_blocks[request_id]
-                if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
-                    blocks[last_state_block_idx] = self._null_block
+        # super().remove_skipped_blocks(
+        #     request_id, processed_computed_tokens, num_prompt_tokens
+        # )
+        # if self.mamba_cache_mode == "align":
+        #     # `last_state_block_idx` refers to the block index allocated two steps ago.
+        #     # The block allocated in the previous step is used to copy Mamba states
+        #     # into the block allocated in the current step; the earlier block is
+        #     # no longer needed and should be freed here.
+        #     last_state_block_idx = self.last_state_block_idx.get(request_id)
+        #     # Blocks allocated during prefill may be non-contiguous. Use
+        #     # `last_state_block_idx` to free the appropriate block and replace it
+        #     # with a null block.
+        #     if (
+        #         last_state_block_idx is not None
+        #         and last_state_block_idx
+        #         < cdiv(processed_computed_tokens, self.block_size) - 1
+        #     ):
+        #         blocks = self.req_to_blocks[request_id]
+        #         if blocks[last_state_block_idx] != self._null_block:
+        #             self.block_pool.free_blocks([blocks[last_state_block_idx]])
+        #             blocks[last_state_block_idx] = self._null_block
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
