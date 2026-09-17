@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import logging
 import sys
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +21,8 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -123,12 +127,14 @@ class ExKVCacheContext:
         block_size: int = 0,
         block_ids: tuple[list[int], ...] | None = None,
         kv_cache_groups: list[KVCacheGroupSpec] | None = None,
-        kv_length_per_token: int | None = None,
+        kv_length_per_block: int | None = None,
     ):
+        # block size for token
         self._block_size: int = block_size
         self._block_ids: tuple[list[int], ...] | None = None
         self._kv_cache_groups: list[KVCacheGroupSpec] | None = None
-        self._kv_length_per_token: int | None = kv_length_per_token
+        # size of each physical block page slot in bytes
+        self._kv_length_per_block: int | None = kv_length_per_block
         self._offset: int = 0
 
         if not segments:
@@ -164,9 +170,7 @@ class ExKVCacheContext:
         return iter(self._segments)
 
     def __repr__(self) -> str:
-        return (
-            f"ExKVCacheContext(segments={list(self._segments)}, _offset={self._offset})"
-        )
+        return f"ExKVCacheContext(segments={list(self._segments)})"
 
     def _check_segments(self):
         prev_end = self._segments[0].token_start
@@ -282,16 +286,28 @@ class ExKVCacheContext:
 
         return block_ids
 
+    @property
+    def kv_length(self) -> int | None:
+        length: int = 0
+        for seg in self._segments:
+            if seg.kv_length is None:
+                return None
+            length += seg.kv_length
+        return length
+
     def result(self, tp_size: int = 1, use_mla: bool = False) -> list[dict]:
-        if self._kv_length_per_token is None:
-            raise ValueError("Missing kv_length_per_token")
+        if self._kv_length_per_block is None:
+            raise ValueError("Missing kv_length_per_block")
 
         if use_mla:
             tp_size = 1
 
         result = []
         for seg in self._segments:
-            kv_length = seg.token_length * self._kv_length_per_token * tp_size
+            block_count = self.get_block_count(seg)
+            assert block_count > 0
+            new_kv_length = block_count * self._kv_length_per_block * tp_size
+
             result.append(
                 ExKVCacheSegment(
                     token_start=seg.token_start,
@@ -299,7 +315,7 @@ class ExKVCacheContext:
                     block_size=self._block_size,
                     kv_uri=seg.kv_uri,
                     kv_start=seg.kv_start,
-                    kv_length=kv_length,
+                    kv_length=new_kv_length,
                 ).to_dict()
             )
 
@@ -368,6 +384,13 @@ class ExKVCacheContext:
 
         return block_ids
 
+    def get_block_count(self, seg: ExKVCacheSegment) -> int:
+        group_block_ids = self.get_block_ids(seg)
+        if group_block_ids is None:
+            return -1
+
+        return sum(len(ids) for ids in group_block_ids)
+
     def reset(self) -> "ExKVCacheContext":
         self._segments = ()
         self._offset = 0
@@ -377,22 +400,25 @@ class ExKVCacheContext:
 
     def update_kv_layout(
         self,
-        kv_length_per_token: int | None = None,
+        kv_length_per_block: int | None = None,
         tp_rank: int | None = None,
         replicates_kv_cache: bool = False,
     ) -> "ExKVCacheContext":
-        if kv_length_per_token is not None:
-            if self._kv_length_per_token is not None:
-                raise ValueError("kv_length_per_token is already set")
-            self._kv_length_per_token = kv_length_per_token
+        if kv_length_per_block is not None:
+            if self._kv_length_per_block is not None:
+                raise ValueError("kv_length_per_block is already set")
+            self._kv_length_per_block = kv_length_per_block
 
         if tp_rank is not None:
-            if self._kv_length_per_token is None:
-                raise ValueError("Setting tp_rank requires kv_length_per_token")
+            if self._kv_length_per_block is None:
+                raise ValueError("Setting tp_rank requires kv_length_per_block")
 
             new_segments = []
             for seg in self._segments:
-                kv_length = seg.token_length * self._kv_length_per_token
+                block_count = self.get_block_count(seg)
+                assert block_count > 0
+                kv_length = block_count * self._kv_length_per_block
+
                 kv_start = seg.kv_start
                 if not replicates_kv_cache:
                     kv_start = seg.kv_start + tp_rank * kv_length
@@ -453,13 +479,13 @@ class ExKVCacheContext:
             elif seg.block_end <= block_offset:
                 new_segments.append(seg)
             else:
-                new_block_length = block_offset - seg.block_start
-                new_token_length = new_block_length * seg.block_size
-                new_kv_length = (
-                    new_token_length * self._kv_length_per_token
-                    if self._kv_length_per_token is not None
-                    else None
-                )
+                new_token_length = (block_offset - seg.block_start) * seg.block_size
+
+                new_kv_length = None
+                block_count = self.get_block_count(seg)
+                if block_count > 0 and self._kv_length_per_block is not None:
+                    new_kv_length = block_count * self._kv_length_per_block
+
                 new_seg = ExKVCacheSegment(
                     token_start=seg.token_start,
                     token_length=new_token_length,
@@ -495,11 +521,27 @@ class ExKVCacheContext:
         if self._block_ids is None:
             raise ValueError("block_ids are not bound")
 
+        t0 = time.perf_counter()
+
         await asyncio.gather(
             *[self._prefetch_seg(seg, kvcache_config) for seg in self._segments]
         )
 
+        if logger.isEnabledFor(logging.DEBUG):
+            elapsed = time.perf_counter() - t0
+            kv_len = self.kv_length or 0
+            bps = kv_len / elapsed if elapsed > 0 else float("inf")
+            logger.debug(
+                "EXKV prefetch %s: %s in %.3fs (%s/s)",
+                self,
+                bytes_to_human(kv_len),
+                elapsed,
+                bytes_to_human(bps),
+            )
+
     async def backup(self, kvcache_config: ExOffloadingStorageKVCacheConfig):
+        t0 = time.perf_counter()
+
         for seg in self._segments:
             block_ids = self.get_block_ids(seg)
             assert block_ids is not None
@@ -509,6 +551,18 @@ class ExKVCacheContext:
             )
 
             await storage.save(path, seg.kv_start, block_ids)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            elapsed = time.perf_counter() - t0
+            kv_len = self.kv_length or 0
+            bps = kv_len / elapsed if elapsed > 0 else float("inf")
+            logger.debug(
+                "EXKV backup %s: %s in %.3fs (%s/s)",
+                self,
+                bytes_to_human(kv_len),
+                elapsed,
+                bytes_to_human(bps),
+            )
 
 
 @dataclass
@@ -522,3 +576,17 @@ class ExOffloadingRequestContext:
 class ExOffloadingConnectorMetadata(KVConnectorMetadata):
     load_req_ctx: list[ExOffloadingRequestContext]
     save_req_ctx: list[ExOffloadingRequestContext]
+
+
+def bytes_to_human(n: float, precision: int = 2) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB")
+    sign = "-" if n < 0 else ""
+    size = abs(n)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{sign}{int(size)} {unit}"
+            return f"{sign}{size:.{precision}f} {unit}"
+        size /= 1024
+
+    return ""

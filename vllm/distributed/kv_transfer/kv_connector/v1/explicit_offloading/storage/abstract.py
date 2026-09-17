@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from abc import abstractmethod
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -9,6 +10,8 @@ import torch
 
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import is_non_overlapping_and_dense
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -39,19 +42,11 @@ class ExOffloadingStorage:
     ) -> None: ...
 
 
-def build_mem_zones(
-    kvcache_config: ExOffloadingStorageKVCacheConfig,
-) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[int]]:
+def build_mem_zones(kv_caches: dict[str, torch.Tensor]) -> list[tuple[int, int]]:
     mem_zones: list[tuple[int, int]] = []
-    mem_region_addrs: list[tuple[int, int]] = []
-    mem_region_block_bytes: list[int] = []
-
     seen_zones_ptrs: set[int] = set()
-    seen_region_ptrs: dict[int, tuple[int, int]] = {}
 
-    num_blocks = kvcache_config.num_blocks
-
-    for cache in kvcache_config.kv_caches.values():
+    for cache in kv_caches.values():
         zone = cache.untyped_storage()
         zone_addr = zone.data_ptr()
         zone_bytes = zone.nbytes()
@@ -60,26 +55,35 @@ def build_mem_zones(
             seen_zones_ptrs.add(zone_addr)
             mem_zones.append((zone_addr, zone_bytes))
 
-        if not is_non_overlapping_and_dense(cache[0]):
-            raise ValueError("Not support `*H*B*` layout for KV cache")
+    return mem_zones
 
-        block_bytes = cache.stride(0) * cache.element_size()
 
-        if block_bytes * num_blocks == zone_bytes:
-            addr = zone_addr
-            nbytes = zone_bytes
-        else:
-            addr = cache.data_ptr()
-            nbytes = cache.nbytes
+def build_mem_tensors(kv_caches: dict[str, torch.Tensor]) -> list[torch.Tensor]:
+    mem_tensors: list[torch.Tensor] = []
+    seen_tensors_ptrs: set[int] = set()
 
-        if addr not in seen_region_ptrs or addr > seen_region_ptrs[addr][0]:
-            seen_region_ptrs[addr] = (nbytes, block_bytes)
+    for layer_name, kv_tensor in kv_caches.items():
+        registered = False
 
-    for addr, (nbytes, block_bytes) in seen_region_ptrs.items():
-        mem_region_addrs.append((addr, nbytes))
-        mem_region_block_bytes.append(block_bytes)
+        # FA:other = 1:N, so only register FA layer
+        if "self_attn" in layer_name and kv_tensor.data_ptr() not in seen_tensors_ptrs:
+            seen_tensors_ptrs.add(kv_tensor.data_ptr())
+            mem_tensors.append(kv_tensor)
+            registered = True
 
-    return mem_zones, mem_region_addrs, mem_region_block_bytes
+        logger.debug(
+            "register_kvcache: %s [%s], address=(%d, %d), "
+            "block_bytes=%d, shape=%s, dtype=%s",
+            "registered" if registered else "skipped",
+            layer_name,
+            kv_tensor.data_ptr(),
+            kv_tensor.nbytes,
+            kv_tensor.stride(0) * kv_tensor.element_size(),
+            kv_tensor.shape,
+            kv_tensor.dtype,
+        )
+
+    return mem_tensors
 
 
 def group_block_contiguous(block_ids: list[int]) -> list[list[int]]:
@@ -102,152 +106,52 @@ def group_block_contiguous(block_ids: list[int]) -> list[list[int]]:
 
 
 @dataclass
-class RegionDesc:
-    offset: int
-    address: list[tuple[int, int]]
-
-
-def _build_mem_regions_for_zone(
-    region_addr: int,
-    region_size: int,
-    block_bytes: int,
-    grouped_block_ids: list[list[int]],
-    file_offset: int,
-) -> tuple[list[RegionDesc], int]:
-    """Build file-to-memory mappings for one memory zone."""
-    regions: list[RegionDesc] = []
-    current_region: RegionDesc | None = None
-
-    for group in grouped_block_ids:
-        group_size = len(group) * block_bytes
-
-        if group[0] == 0:
-            if current_region is not None:
-                regions.append(current_region)
-                current_region = None
-            file_offset += group_size
-            continue
-
-        group_addr = region_addr + group[0] * block_bytes
-        group_end = group_addr + group_size
-        region_end = region_addr + region_size
-        if group_end > region_end:
-            raise ValueError(
-                f"memory region [{group_addr}, {group_end}] is out of bound"
-            )
-
-        if current_region is None:
-            current_region = RegionDesc(offset=file_offset, address=[])
-
-        current_region.address.append((group_addr, group_size))
-        file_offset += group_size
-
-    if current_region is not None:
-        regions.append(current_region)
-
-    return regions, file_offset
-
-
-def get_mem_regions(
-    mem_region_addrs: list[tuple[int, int]],
-    mem_region_block_bytes: list[int],
-    block_ids: list[list[int]],
-) -> list[RegionDesc]:
-    """Map logical block IDs to file offsets and GPU memory addresses."""
-    if len(mem_region_addrs) != len(mem_region_block_bytes):
-        raise ValueError(
-            "mem_region_addrs and mem_region_block_bytes must have the same length"
-        )
-
-    flattened_block_ids = [block_id for group in block_ids for block_id in group]
-    grouped_block_ids = group_block_contiguous(flattened_block_ids)
-
-    mem_regions: list[RegionDesc] = []
-    file_offset = 0
-
-    for (region_addr, region_size), block_bytes in zip(
-        mem_region_addrs, mem_region_block_bytes
-    ):
-        zone_regions, file_offset = _build_mem_regions_for_zone(
-            region_addr,
-            region_size,
-            block_bytes,
-            grouped_block_ids,
-            file_offset,
-        )
-        mem_regions.extend(zone_regions)
-
-    return mem_regions
-
-
-@dataclass
-class RegionTensor:
+class MemRegion:
     offset: int
     tensors: list[torch.Tensor]
 
 
-def _build_mem_tensors_for_cache(
-    cache: torch.Tensor,
-    block_bytes: int,
-    grouped_block_ids: list[list[int]],
-    file_offset: int,
-) -> tuple[list[RegionTensor], int]:
-    tensors: list[RegionTensor] = []
-    current_region: RegionTensor | None = None
-    num_blocks = cache.shape[0]
-
-    for group in grouped_block_ids:
-        group_size = len(group) * block_bytes
-
-        if group[0] == 0:
-            if current_region is not None:
-                tensors.append(current_region)
-                current_region = None
-            file_offset += group_size
-            continue
-
-        if group[0] + len(group) > num_blocks:
-            raise ValueError(
-                f"block range [{group[0]}, {group[0] + len(group)}) "
-                f"out of bound for cache with {num_blocks} blocks"
-            )
-
-        if current_region is None:
-            current_region = RegionTensor(offset=file_offset, tensors=[])
-
-        current_region.tensors.append(cache[group[0] : group[0] + len(group)])
-        file_offset += group_size
-
-    if current_region is not None:
-        tensors.append(current_region)
-
-    return tensors, file_offset
-
-
-def get_mem_tensors(
-    kv_caches: dict[str, torch.Tensor],
+def get_mem_regions(
+    kv_caches: list[torch.Tensor],
     block_ids: list[list[int]],
-) -> list[RegionTensor]:
-    flattened_block_ids = [block_id for group in block_ids for block_id in group]
-    grouped_block_ids = group_block_contiguous(flattened_block_ids)
+) -> list[MemRegion]:
+    """Build file-contiguous MemRegions spanning all caches.
 
-    mem_tensors: list[RegionTensor] = []
+    Adjacent non-placeholder block groups — even across cache boundaries —
+    share one region so each contiguous file range is a single I/O.
+    """
+    grouped = group_block_contiguous([b for g in block_ids for b in g])
+
+    regions: list[MemRegion] = []
+    current: MemRegion | None = None
     file_offset = 0
 
-    for cache in kv_caches.values():
+    for cache in kv_caches:
         if not is_non_overlapping_and_dense(cache[0]):
             raise ValueError("Not support `*H*B*` layout for KV cache")
-
         block_bytes = cache.stride(0) * cache.element_size()
-        cache_tensors, file_offset = _build_mem_tensors_for_cache(
-            cache,
-            block_bytes,
-            grouped_block_ids,
-            file_offset,
-        )
-        mem_tensors.extend(cache_tensors)
+        num_blocks = cache.shape[0]
 
-    return mem_tensors
+        for group in grouped:
+            group_bytes = len(group) * block_bytes
+            if group[0] == 0:
+                if current is not None:
+                    regions.append(current)
+                    current = None
+            else:
+                if group[0] + len(group) > num_blocks:
+                    raise ValueError(
+                        f"block range [{group[0]}, {group[0] + len(group)}) "
+                        f"out of bound for cache with {num_blocks} blocks"
+                    )
+                if current is None:
+                    current = MemRegion(offset=file_offset, tensors=[])
+                current.tensors.append(cache[group[0] : group[0] + len(group)])
+            file_offset += group_bytes
+
+    if current is not None:
+        regions.append(current)
+    return regions
 
 
 def copy_data_h2d(
@@ -259,11 +163,19 @@ def copy_data_h2d(
     copy: bool = True,
 ) -> tuple[int, int]:
     """Copy at most ``host_bytes`` of ``host_data`` into ``dev_data_list``.
+
+    Each device tensor is written in physical (storage) order so the host
+    buffer byte layout matches a DIRECT/SGE transfer using the tensor's
+    ``data_ptr()``/``nbytes``. This lets save/load bounce and direct policies
+    be mixed without reordering permuted (e.g. LBHNC) KV caches.
+
     Args:
         host_data: Flat source tensor on host.
-        dev_data_list: Destination tensors, filled sequentially once flattened.
+        dev_data_list: Destination tensors, filled sequentially in physical
+            storage order.
         dev_index: Index of the destination tensor to start copying into.
-        dev_off: Element offset within ``dev_data_list[dev_index]``.
+        dev_off: Element offset within ``dev_data_list[dev_index]``'s physical
+            storage.
         host_bytes: Number of valid bytes in ``host_data``; 0 means all of it.
         copy: When False, only compute the next destination position.
     Returns:
@@ -282,19 +194,20 @@ def copy_data_h2d(
         idx, off = dev_index, dev_off
         host_off = 0
         while host_off < host_numel and idx < len(dev_data_list):
-            df = dev_data_list[idx].flatten()
-            if off >= df.numel():
+            d = dev_data_list[idx]
+            dp = d.as_strided((d.numel(),), (1,))
+            if off >= dp.numel():
                 idx += 1
                 off = 0
                 continue
-            n = min(df.numel() - off, host_numel - host_off)
+            n = min(dp.numel() - off, host_numel - host_off)
             if copy:
-                df[off : off + n].copy_(
+                dp[off : off + n].copy_(
                     host_data[host_off : host_off + n], non_blocking=True
                 )
             host_off += n
             off += n
-            if off == df.numel():
+            if off == dp.numel():
                 idx += 1
                 off = 0
 
@@ -313,11 +226,19 @@ def copy_data_d2h(
     copy: bool = True,
 ) -> tuple[int, int]:
     """Copy at most ``host_bytes`` of ``dev_data_list`` into ``host_data``.
+
+    Each device tensor is read in physical (storage) order so the host buffer
+    byte layout matches a DIRECT/SGE transfer using the tensor's
+    ``data_ptr()``/``nbytes``. This lets save/load bounce and direct policies
+    be mixed without reordering permuted (e.g. LBHNC) KV caches.
+
     Args:
         host_data: Flat destination tensor on host.
-        dev_data_list: Source tensors, consumed sequentially once flattened.
+        dev_data_list: Source tensors, consumed sequentially in physical
+            storage order.
         dev_index: Index of the source tensor to start copying from.
-        dev_off: Element offset within ``dev_data_list[dev_index]``.
+        dev_off: Element offset within ``dev_data_list[dev_index]``'s physical
+            storage.
         host_bytes: Number of bytes to write into ``host_data``; 0 means all.
         copy: When False, only compute the next source position.
     Returns:
@@ -336,19 +257,20 @@ def copy_data_d2h(
         idx, off = dev_index, dev_off
         host_off = 0
         while host_off < host_numel and idx < len(dev_data_list):
-            df = dev_data_list[idx].flatten()
-            if off >= df.numel():
+            d = dev_data_list[idx]
+            dp = d.as_strided((d.numel(),), (1,))
+            if off >= dp.numel():
                 idx += 1
                 off = 0
                 continue
-            n = min(df.numel() - off, host_numel - host_off)
+            n = min(dp.numel() - off, host_numel - host_off)
             if copy:
                 host_data[host_off : host_off + n].copy_(
-                    df[off : off + n], non_blocking=True
+                    dp[off : off + n], non_blocking=True
                 )
             host_off += n
             off += n
-            if off == df.numel():
+            if off == dp.numel():
                 idx += 1
                 off = 0
 

@@ -65,13 +65,8 @@ class ExOffloadingConnectorScheduler:
         self._loading_requests: dict[str, ExOffloadingRequestContext] = {}
         self._saving_requests: dict[str, ExOffloadingRequestContext] = {}
 
-        self._block_bytes_per_layer = []
-        for tensor in kv_cache_config.kv_cache_tensors:
-            self._block_bytes_per_layer.append(
-                tensor.size // kv_cache_config.num_blocks
-            )
-
-        self._kv_bytes_per_token = sum(self._block_bytes_per_layer) // self._block_size
+        total_size = kv_cache_config.kv_cache_tensors[0].size
+        self._kv_bytes_per_block = total_size // (kv_cache_config.num_blocks)
 
         self._kv_cache_groups = kv_cache_config.kv_cache_groups
 
@@ -148,7 +143,7 @@ class ExOffloadingConnectorScheduler:
 
         stored_exkvcache.truncate_prefix(num_computed_blocks)
         stored_exkvcache.bind_block_ids(block_ids, self._kv_cache_groups)
-        stored_exkvcache.update_kv_layout(kv_length_per_token=self._kv_bytes_per_token)
+        stored_exkvcache.update_kv_layout(kv_length_per_block=self._kv_bytes_per_block)
 
         self._loading_requests[request.request_id] = ExOffloadingRequestContext(
             id=params.id,
@@ -182,7 +177,7 @@ class ExOffloadingConnectorScheduler:
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        if len(block_ids) == 0:
+        if len(block_ids) == 0 or len(block_ids[0]) == 0:
             return False, None
 
         assert request.request_id not in self._saving_requests, (
@@ -217,7 +212,7 @@ class ExOffloadingConnectorScheduler:
 
         fresh_exkvcache.truncate_suffix(block_count)
         fresh_exkvcache.bind_block_ids(block_ids, self._kv_cache_groups)
-        fresh_exkvcache.update_kv_layout(kv_length_per_token=self._kv_bytes_per_token)
+        fresh_exkvcache.update_kv_layout(kv_length_per_block=self._kv_bytes_per_block)
 
         kv_xfer_params = dict(
             kvcache_params=ExOffloadingParams(
